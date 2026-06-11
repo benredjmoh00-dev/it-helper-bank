@@ -1545,12 +1545,30 @@ function boot() {
     list.innerHTML = items.length
       ? items.map((i) => `
         <div class="notif-item ${i.read ? "" : "unread"}">
+          <button class="notif-del" data-id="${escapeHtml(i.id)}" title="Delete">✕</button>
           <div class="notif-title">${escapeHtml(i.title || "Notification")}</div>
           <div class="notif-body">${escapeHtml(i.body || "")}</div>
         </div>`).join("")
       : `<div class="notif-empty">No notifications yet.</div>`;
-    document.getElementById("notifList").dataset.ids =
-      items.filter((i) => !i.read).map((i) => i.id).join(",");
+    list.dataset.ids = items.filter((i) => !i.read).map((i) => i.id).join(",");
+    list.dataset.allIds = items.map((i) => i.id).join(",");
+    list.querySelectorAll(".notif-del").forEach((b) => {
+      b.onclick = (e) => { e.stopPropagation(); deleteNotif(b.dataset.id); };
+    });
+  }
+
+  async function deleteNotif(id) {
+    if (!me || !id) return;
+    try { await deleteDoc(doc(db, "notifications", me.uid, "items", id)); }
+    catch (e) { window.App.toast("Could not delete notification"); }
+  }
+
+  async function clearAllNotifs() {
+    if (!me) return;
+    const ids = (document.getElementById("notifList").dataset.allIds || "").split(",").filter(Boolean);
+    if (!ids.length) return;
+    await Promise.all(ids.map((id) =>
+      deleteDoc(doc(db, "notifications", me.uid, "items", id)).catch(() => {})));
   }
 
   async function markAllRead() {
@@ -1594,7 +1612,11 @@ function boot() {
       .notif-head{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid var(--stroke)}
       .notif-head b{color:var(--text);font-size:14px}
       .notif-head button{background:none;border:none;color:var(--brand-2);cursor:pointer;font-size:12px}
-      .notif-item{padding:12px 14px;border-bottom:1px solid var(--stroke)}
+      .notif-actions{display:flex;gap:8px}
+      .notif-item{position:relative;padding:12px 36px 12px 14px;border-bottom:1px solid var(--stroke)}
+      .notif-del{position:absolute;top:8px;right:8px;background:none;border:none;color:var(--text-faint);
+        cursor:pointer;font-size:13px;line-height:1;padding:3px 6px;border-radius:6px}
+      .notif-del:hover{color:var(--danger);background:rgba(255,93,115,0.12)}
       .notif-item.unread{background:rgba(43,108,255,0.10)}
       .notif-title{color:var(--text);font-size:13px;font-weight:600}
       .notif-body{color:var(--text-dim);font-size:12px;margin-top:3px}
@@ -1701,7 +1723,12 @@ function boot() {
     panel.className = "notif-panel";
     panel.id = "notifPanel";
     panel.innerHTML = `
-      <div class="notif-head"><b>Notifications</b><button id="notifReadAll">Mark all read</button></div>
+      <div class="notif-head"><b>Notifications</b>
+        <span class="notif-actions">
+          <button id="notifReadAll">Mark all read</button>
+          <button id="notifClearAll">Clear all</button>
+        </span>
+      </div>
       <div id="notifList"><div class="notif-empty">No notifications yet.</div></div>`;
     document.body.appendChild(panel);
     bell.onclick = () => {
@@ -1709,6 +1736,7 @@ function boot() {
       if (panel.classList.contains("open")) markAllRead();
     };
     panel.querySelector("#notifReadAll").onclick = markAllRead;
+    panel.querySelector("#notifClearAll").onclick = clearAllNotifs;
     document.addEventListener("click", (e) => {
       if (!panel.contains(e.target) && !bell.contains(e.target)) panel.classList.remove("open");
     });
