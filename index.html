@@ -1301,8 +1301,10 @@ document.addEventListener("DOMContentLoaded", App.init);
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import { getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc, collection, getDocs, addDoc,
-         onSnapshot, runTransaction, serverTimestamp, query, orderBy, limit, where }
+         onSnapshot, runTransaction, serverTimestamp, query, orderBy, limit, where, arrayUnion }
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { getMessaging, getToken, onMessage }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging.js";
 
 /* ===========================================================
    Firebase config (⚙ Project settings → Your apps → Web </>).
@@ -1334,6 +1336,11 @@ function boot() {
   const ADMIN_IDS = ["mohammed"];
   const isAdmin = () => !!me && ADMIN_IDS.includes(me.uid);
   const DELETE_CODE = "1976"; // code required to confirm a user deletion
+
+  // Web Push (FCM). Paste the VAPID key from Firebase → Cloud Messaging →
+  // Web Push certificates. Until set, push registration is skipped silently.
+  const VAPID_KEY = "PASTE_VAPID_KEY";
+  let messaging = null;
 
   let me = null;            // { uid, displayName, balance, iban }
   let notifUnsub = null;
@@ -1408,6 +1415,7 @@ function boot() {
     setHeaderUser(me);
     await loadDirectory();
     watchNotifications();
+    initPush();
   }
 
   function logout() {
@@ -1572,6 +1580,28 @@ function boot() {
     if (!ids.length) return;
     await Promise.all(ids.map((id) =>
       deleteDoc(doc(db, "notifications", me.uid, "items", id)).catch(() => {})));
+  }
+
+  // ---------- Web push (works even when the app is closed) ----------
+  async function initPush() {
+    try {
+      if (!("serviceWorker" in navigator) || !("Notification" in window)) return;
+      if (VAPID_KEY.includes("PASTE")) return; // VAPID key not set yet
+      const reg = await navigator.serviceWorker.register("firebase-messaging-sw.js");
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") return;
+      if (!messaging) messaging = getMessaging(app);
+      const token = await getToken(messaging, { vapidKey: VAPID_KEY, serviceWorkerRegistration: reg });
+      if (token && me) {
+        await updateDoc(doc(db, "users", me.uid), { fcmTokens: arrayUnion(token) });
+      }
+      // Foreground: also pop a system notification.
+      onMessage(messaging, (payload) => {
+        const d = (payload && payload.data) || {};
+        try { reg.showNotification(d.title || "IT Helper Bank", { body: d.body || "", icon: "assets/logo.png" }); }
+        catch (e) {}
+      });
+    } catch (e) { console.warn("[IT Helper Bank] push init failed:", e); }
   }
 
   async function markAllRead() {
