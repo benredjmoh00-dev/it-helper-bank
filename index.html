@@ -507,27 +507,9 @@
   <!-- ===== Header ===== -->
   <header class="topbar">
     <div class="brand" onclick="App.go('welcome')" title="Home">
-      <!-- SVG logo: circular icon, payment + wrench, blue/cyan gradient -->
-      <svg class="logo" viewBox="0 0 64 64" fill="none" aria-label="IT Helper Bank logo">
-        <defs>
-          <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0" stop-color="#2b6cff"/>
-            <stop offset="1" stop-color="#19d3e6"/>
-          </linearGradient>
-        </defs>
-        <circle cx="32" cy="32" r="30" fill="url(#lg)"/>
-        <circle cx="32" cy="32" r="30" fill="none" stroke="rgba(255,255,255,0.25)" stroke-width="1.5"/>
-        <!-- euro symbol -->
-        <path d="M39 22.5a11 11 0 1 0 0 19" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/>
-        <path d="M22 28.5h15M22 35.5h13" stroke="#fff" stroke-width="3.4" stroke-linecap="round"/>
-        <!-- wrench accent -->
-        <path d="M44 40.5l5.5 5.5M44.5 36.5a4.2 4.2 0 0 0 5.4 5.4l-2.2-2.2.8-2 2-.8 2.2 2.2a4.2 4.2 0 0 0-5.4-5.4l1.9 1.9-.7 2-2 .7-1.9-1.8z"
-              fill="#eaf6ff" stroke="#eaf6ff" stroke-width="0.6" stroke-linejoin="round"/>
-      </svg>
-      <div>
-        <div class="name">IT Helper <span>Bank</span></div>
-        <div class="tag">Secure reward transfers</div>
-      </div>
+      <!-- Brand logo (assets/logo.png — transparent PNG) -->
+      <img src="assets/logo.png" alt="IT Helper Bank — Rewarding Technical Excellence"
+           class="brand-logo" style="height:46px;width:auto;display:block" />
     </div>
     <nav class="topnav">
       <button onclick="App.go('welcome')"><span class="nav-text">Home</span></button>
