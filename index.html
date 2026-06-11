@@ -1285,8 +1285,6 @@ document.addEventListener("DOMContentLoaded", App.init);
      ============================================================ -->
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import { getAuth, onAuthStateChanged, signInWithPopup, GoogleAuthProvider, OAuthProvider, signOut }
-  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import { getFirestore, doc, getDoc, setDoc, updateDoc, collection, getDocs, addDoc,
          onSnapshot, runTransaction, serverTimestamp, query, orderBy, limit }
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
@@ -1313,61 +1311,89 @@ if (!CONFIGURED) {
 }
 
 function boot() {
-  const app  = initializeApp(firebaseConfig);
-  const auth = getAuth(app);
-  const db   = getFirestore(app);
+  const app = initializeApp(firebaseConfig);
+  const db  = getFirestore(app);
   const STARTING_BALANCE = 5000;
 
-  let me = null;            // { uid, displayName, email, photoURL, balance, iban }
+  let me = null;            // { uid, displayName, balance, iban }
   let notifUnsub = null;
 
   injectStyles();
   buildLoginGate();
   buildHeaderUI();
   buildMessagesScreen();
-  showGate(true); // show login until auth state is known
+  showGate(true);
 
-  // ---------- Auth state ----------
-  onAuthStateChanged(auth, async (user) => {
-    if (!user) {
-      me = null;
-      if (notifUnsub) { notifUnsub(); notifUnsub = null; }
-      showGate(true);
-      setHeaderSignedOut();
-      return;
-    }
-    me = await ensureUserDoc(user);
-    showGate(false);
-    window.App.setAccount({ balance: me.balance, iban: me.iban });
-    setHeaderUser(me);
-    await loadDirectory();
-    watchNotifications();
-  });
+  // ---------- Session restore (name + PIN, no SSO) ----------
+  const savedId = localStorage.getItem("ithb:uid");
+  if (savedId) {
+    getDoc(doc(db, "users", savedId)).then((snap) => {
+      if (snap.exists()) setLoggedIn(savedId, snap.data());
+      else { localStorage.removeItem("ithb:uid"); showGate(true); }
+    }).catch(() => showGate(true));
+  }
 
   // ---------- Public bridge for the main app ----------
   window.Bank = {
     enabled: true,
     performTransfer,
-    signIn,
-    signOutNow: () => signOut(auth),
-    sendMessage
+    sendMessage,
+    logout
   };
 
-  // ---------- User docs ----------
-  async function ensureUserDoc(user) {
-    const ref = doc(db, "users", user.uid);
+  // ---------- Auth: first name + PIN ----------
+  function normalizeId(name) {
+    return name.trim().toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "")
+      .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  }
+
+  async function hashPin(pin) {
+    try {
+      if (crypto && crypto.subtle) {
+        const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("ithb:" + pin));
+        return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+      }
+    } catch (e) {}
+    let h = 5381; const s = "ithb:" + pin;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+    return "f" + h.toString(16);
+  }
+
+  async function login(name, pin) {
+    name = (name || "").trim();
+    if (name.length < 2) throw new Error("Entre ton prénom");
+    if (!/^\d{4}$/.test(pin || "")) throw new Error("Le code PIN doit faire 4 chiffres");
+    const uid = normalizeId(name);
+    if (!uid) throw new Error("Prénom invalide");
+    const ref = doc(db, "users", uid);
     const snap = await getDoc(ref);
-    if (snap.exists()) return { uid: user.uid, ...snap.data() };
-    const data = {
-      displayName: user.displayName || (user.email || "").split("@")[0] || "New User",
-      email: user.email || "",
-      photoURL: user.photoURL || "",
-      balance: STARTING_BALANCE,
-      iban: genIban(),
-      createdAt: serverTimestamp()
-    };
-    await setDoc(ref, data);
-    return { uid: user.uid, ...data };
+    const ph = await hashPin(pin);
+    if (snap.exists()) {
+      if (snap.data().pinHash !== ph) throw new Error("Ce prénom est déjà pris, ou le PIN est incorrect");
+      await setLoggedIn(uid, snap.data());
+    } else {
+      const data = { displayName: name, pinHash: ph, balance: STARTING_BALANCE, iban: genIban(), createdAt: serverTimestamp() };
+      await setDoc(ref, data);
+      await setLoggedIn(uid, data);
+    }
+  }
+
+  async function setLoggedIn(uid, data) {
+    me = { uid, ...data };
+    localStorage.setItem("ithb:uid", uid);
+    showGate(false);
+    window.App.setAccount({ balance: me.balance, iban: me.iban });
+    setHeaderUser(me);
+    await loadDirectory();
+    watchNotifications();
+  }
+
+  function logout() {
+    if (notifUnsub) { notifUnsub(); notifUnsub = null; }
+    me = null;
+    localStorage.removeItem("ithb:uid");
+    setHeaderSignedOut();
+    showGate(true);
   }
 
   function genIban() {
@@ -1511,13 +1537,6 @@ function boot() {
       updateDoc(doc(db, "notifications", me.uid, "items", id), { read: true }).catch(() => {})));
   }
 
-  // ---------- Auth actions ----------
-  async function signIn(which) {
-    const provider = which === "microsoft" ? new OAuthProvider("microsoft.com") : new GoogleAuthProvider();
-    try { await signInWithPopup(auth, provider); }
-    catch (e) { alert("Sign-in failed: " + (e && e.message ? e.message : e)); }
-  }
-
   /* ====================== UI building ====================== */
   function injectStyles() {
     const css = `
@@ -1534,6 +1553,11 @@ function boot() {
       .sso-btn:hover{transform:translateY(-1px);filter:brightness(.97)}
       .sso-btn.ms{background:#2f2f2f;color:#fff}
       .sso-btn img,.sso-btn svg{height:20px;width:20px}
+      .gate-input{width:100%;padding:13px 14px;margin:8px 0;border-radius:var(--radius-sm);
+        border:1px solid var(--stroke-strong);background:rgba(8,12,24,0.6);color:var(--text);
+        font-size:15px;box-sizing:border-box}
+      .gate-input:focus{outline:none;border-color:var(--brand-2)}
+      .gate-err{color:var(--danger);font-size:13px;min-height:18px;margin-top:8px}
       .acct-chip{display:flex;align-items:center;gap:8px;color:var(--text)}
       .acct-chip img{height:30px;width:30px;border-radius:50%;object-fit:cover;border:1px solid var(--stroke-strong)}
       .acct-chip .nm{font-size:13px;font-weight:600;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1566,19 +1590,26 @@ function boot() {
     gate.className = "gate";
     gate.id = "loginGate";
     gate.style.display = "none";
-    const gIcon = `<svg viewBox="0 0 24 24"><path fill="#EA4335" d="M12 10.2v3.9h5.5c-.24 1.3-1 2.4-2.1 3.1v2.6h3.4c2-1.85 3.1-4.55 3.1-7.75 0-.74-.07-1.46-.2-2.15H12z"/><path fill="#34A853" d="M12 22c2.7 0 4.97-.9 6.63-2.43l-3.4-2.6c-.94.63-2.14 1-3.23 1-2.48 0-4.58-1.67-5.33-3.93H3.16v2.47A10 10 0 0 0 12 22z"/><path fill="#FBBC05" d="M6.67 14.04A6 6 0 0 1 6.35 12c0-.71.12-1.4.32-2.04V7.49H3.16A10 10 0 0 0 2 12c0 1.62.39 3.15 1.16 4.51l3.51-2.47z"/><path fill="#4285F4" d="M12 6.03c1.47 0 2.79.51 3.83 1.5l2.87-2.87C16.97 2.99 14.7 2 12 2A10 10 0 0 0 3.16 7.49l3.51 2.47C7.42 7.7 9.52 6.03 12 6.03z"/></svg>`;
-    const msIcon = `<svg viewBox="0 0 24 24"><path fill="#F25022" d="M2 2h9.5v9.5H2z"/><path fill="#7FBA00" d="M12.5 2H22v9.5h-9.5z"/><path fill="#00A4EF" d="M2 12.5h9.5V22H2z"/><path fill="#FFB900" d="M12.5 12.5H22V22h-9.5z"/></svg>`;
     gate.innerHTML = `
       <div class="gate-card">
         <img src="assets/logo.png" alt="IT Helper Bank" />
-        <h2>Sign in to IT Helper Bank</h2>
-        <p>Connecte-toi pour accéder à ton compte, envoyer des récompenses et recevoir des notifications.</p>
-        <button class="sso-btn" id="ssoGoogle">${gIcon}<span>Continue with Google</span></button>
-        <button class="sso-btn ms" id="ssoMicrosoft">${msIcon}<span>Continue with Microsoft</span></button>
+        <h2>Connexion</h2>
+        <p>Entre ton prénom et un code PIN. La première fois, ton compte est créé automatiquement.</p>
+        <input id="loginName" class="gate-input" placeholder="Ton prénom" autocomplete="off" />
+        <input id="loginPin" class="gate-input" placeholder="Code PIN (4 chiffres)" inputmode="numeric" maxlength="4" />
+        <button class="sso-btn" id="loginBtn"><span>Se connecter / Créer mon compte</span></button>
+        <div id="loginErr" class="gate-err"></div>
       </div>`;
     document.body.appendChild(gate);
-    gate.querySelector("#ssoGoogle").onclick = () => signIn("google");
-    gate.querySelector("#ssoMicrosoft").onclick = () => signIn("microsoft");
+    const doLogin = async () => {
+      const err = document.getElementById("loginErr");
+      err.textContent = "";
+      try {
+        await login(document.getElementById("loginName").value, document.getElementById("loginPin").value);
+      } catch (e) { err.textContent = (e && e.message) || "Erreur de connexion"; }
+    };
+    gate.querySelector("#loginBtn").onclick = doLogin;
+    gate.querySelector("#loginPin").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
   }
 
   function showGate(show) {
@@ -1628,7 +1659,7 @@ function boot() {
     out.id = "signOutBtn";
     out.textContent = "Sign out";
     out.style.display = "none";
-    out.onclick = () => signOut(auth);
+    out.onclick = () => logout();
     nav.appendChild(out);
   }
 
