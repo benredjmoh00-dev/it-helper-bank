@@ -1285,7 +1285,7 @@ document.addEventListener("DOMContentLoaded", App.init);
      ============================================================ -->
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import { getFirestore, doc, getDoc, setDoc, updateDoc, collection, getDocs, addDoc,
+import { getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc, collection, getDocs, addDoc,
          onSnapshot, runTransaction, serverTimestamp, query, orderBy, limit, where }
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
@@ -1312,6 +1312,11 @@ function boot() {
   const db  = getFirestore(app);
   const STARTING_BALANCE = 5000;
 
+  // Accounts allowed to delete users (add more ids here, e.g. "martin").
+  const ADMIN_IDS = ["mohammed"];
+  const isAdmin = () => !!me && ADMIN_IDS.includes(me.uid);
+  const DELETE_CODE = "1976"; // code required to confirm a user deletion
+
   let me = null;            // { uid, displayName, balance, iban }
   let notifUnsub = null;
 
@@ -1320,6 +1325,7 @@ function boot() {
   buildHeaderUI();
   buildMessagesScreen();
   buildHistoryScreen();
+  buildAdminScreen();
   showGate(true);
 
   // ---------- Session restore (name + PIN, no SSO) ----------
@@ -1606,6 +1612,9 @@ function boot() {
       .hist-amt{font-weight:700;font-size:14px;flex:none}
       .hist-amt.sent{color:var(--danger)}
       .hist-amt.recv{color:var(--success)}
+      .del-btn{background:rgba(255,93,115,0.14);border:1px solid var(--danger);color:var(--danger);
+        border-radius:var(--radius-sm);padding:7px 12px;cursor:pointer;font-size:12px;font-weight:600;flex:none}
+      .del-btn:hover{background:var(--danger);color:#fff}
     `;
     const s = document.createElement("style");
     s.textContent = css;
@@ -1658,6 +1667,14 @@ function boot() {
     histBtn.onclick = () => { window.App.go("history"); loadHistory(); };
     nav.insertBefore(histBtn, msgBtn.nextSibling);
 
+    // Admin nav button (only shown to admins on sign-in)
+    const adminBtn = document.createElement("button");
+    adminBtn.id = "adminBtn";
+    adminBtn.style.display = "none";
+    adminBtn.innerHTML = `<span class="nav-text">Admin</span>`;
+    adminBtn.onclick = () => { window.App.go("admin"); loadUsers(); };
+    nav.insertBefore(adminBtn, histBtn.nextSibling);
+
     // Notification bell + panel
     const bell = document.createElement("button");
     bell.className = "icon-btn";
@@ -1703,6 +1720,7 @@ function boot() {
       `<span class="nm">${escapeHtml(u.displayName)}</span>`;
     document.getElementById("signOutBtn").style.display = "inline-block";
     document.getElementById("notifBell").style.display = "inline-block";
+    document.getElementById("adminBtn").style.display = isAdmin() ? "inline-block" : "none";
   }
 
   function setHeaderSignedOut() {
@@ -1710,6 +1728,8 @@ function boot() {
     if (chip) chip.style.display = "none";
     const out = document.getElementById("signOutBtn");
     if (out) out.style.display = "none";
+    const adm = document.getElementById("adminBtn");
+    if (adm) adm.style.display = "none";
   }
 
   let chatUnsub = null;
@@ -1844,6 +1864,78 @@ function boot() {
         <div class="hist-amt ${sent ? "sent" : "recv"}">${sent ? "−" : "+"}${fmt(t.amount)}</div>
       </div>`;
     }).join("");
+  }
+
+  // ---------- Admin: manage / delete users ----------
+  function buildAdminScreen() {
+    const main = document.querySelector("main");
+    if (!main) return;
+    const sec = document.createElement("section");
+    sec.className = "screen";
+    sec.id = "screen-admin";
+    sec.innerHTML = `
+      <div class="card">
+        <span class="eyebrow">Admin</span>
+        <h2 class="title" style="margin-top:6px;">Manage users</h2>
+        <p class="desc" style="margin-top:6px;">Delete accounts (e.g. test users). This cannot be undone.</p>
+        <div id="adminList" class="hist-list"><div class="chat-empty">Loading…</div></div>
+        <div class="btn-row" style="margin-top:14px;">
+          <button type="button" class="btn btn-ghost" style="max-width:120px" onclick="App.go('transfer')">Back</button>
+          <button type="button" class="btn btn-primary" id="adminRefresh" style="max-width:140px">Refresh</button>
+        </div>
+      </div>`;
+    main.appendChild(sec);
+    sec.querySelector("#adminRefresh").onclick = loadUsers;
+  }
+
+  async function loadUsers() {
+    const list = document.getElementById("adminList");
+    if (!list) return;
+    if (!isAdmin()) { list.innerHTML = `<div class="chat-empty">Admins only.</div>`; return; }
+    list.innerHTML = `<div class="chat-empty">Loading…</div>`;
+    try {
+      const snap = await getDocs(collection(db, "users"));
+      const users = [];
+      snap.forEach((d) => users.push({ uid: d.id, ...d.data() }));
+      users.sort((a, b) => (a.displayName || "").localeCompare(b.displayName || ""));
+      renderUsers(users);
+    } catch (e) {
+      list.innerHTML = `<div class="chat-empty">Could not load users.</div>`;
+    }
+  }
+
+  function renderUsers(users) {
+    const list = document.getElementById("adminList");
+    if (!users.length) { list.innerHTML = `<div class="chat-empty">No users.</div>`; return; }
+    const fmt = (n) => "€" + Number(n || 0).toLocaleString("en-IE", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    list.innerHTML = users.map((u) => {
+      const meTag = u.uid === me.uid ? " (you)" : "";
+      return `<div class="hist-item">
+        <div class="hist-ic recv">${escapeHtml((u.displayName || "?").charAt(0).toUpperCase())}</div>
+        <div class="hist-main"><div class="hist-title">${escapeHtml(u.displayName || u.uid)}${meTag}</div>
+          <div class="hist-sub">balance ${fmt(u.balance)}</div></div>
+        <button class="del-btn" data-uid="${escapeHtml(u.uid)}" data-name="${escapeHtml(u.displayName || u.uid)}">Delete</button>
+      </div>`;
+    }).join("");
+    list.querySelectorAll(".del-btn").forEach((btn) => {
+      btn.onclick = () => deleteUser(btn.dataset.uid, btn.dataset.name);
+    });
+  }
+
+  async function deleteUser(uid, name) {
+    if (!isAdmin()) return;
+    const code = prompt(`Enter the admin code to delete "${name}" (cannot be undone):`);
+    if (code === null) return;                 // cancelled
+    if (code !== DELETE_CODE) { window.App.toast("Wrong code"); return; }
+    try {
+      await deleteDoc(doc(db, "users", uid));
+      window.App.toast(`Deleted ${name}`);
+      if (uid === me.uid) { logout(); return; }
+      await loadUsers();
+      await loadDirectory();
+    } catch (e) {
+      window.App.toast("Could not delete user");
+    }
   }
 
   function escapeHtml(s) {
