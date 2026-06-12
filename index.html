@@ -1351,6 +1351,7 @@ function boot() {
   buildMessagesScreen();
   buildHistoryScreen();
   buildAdminScreen();
+  buildQRUI();
   showGate(true);
 
   // ---------- Session restore (name + PIN, no SSO) ----------
@@ -1685,6 +1686,25 @@ function boot() {
       .del-btn{background:rgba(255,93,115,0.14);border:1px solid var(--danger);color:var(--danger);
         border-radius:var(--radius-sm);padding:7px 12px;cursor:pointer;font-size:12px;font-weight:600;flex:none}
       .del-btn:hover{background:var(--danger);color:#fff}
+      .qr-action-row{display:flex;gap:10px;margin:2px 0 18px}
+      .qr-chip{flex:1;display:flex;align-items:center;justify-content:center;gap:8px;padding:12px;
+        border-radius:var(--radius-sm);border:1px solid var(--stroke-strong);background:rgba(120,160,230,0.08);
+        color:var(--text);font:inherit;font-size:13px;font-weight:600;cursor:pointer;
+        transition:transform .12s,background .2s;-webkit-tap-highlight-color:transparent}
+      .qr-chip:hover{transform:translateY(-1px);background:rgba(120,160,230,0.16)}
+      .qr-chip svg{width:18px;height:18px;flex:none}
+      .qr-box{background:#fff;border-radius:14px;padding:14px;margin:16px auto 6px;width:220px;height:220px;
+        display:grid;place-items:center}
+      .qr-box img{width:100%;height:100%;image-rendering:pixelated}
+      .qr-loading{color:#333;font-size:13px;text-align:center;padding:0 8px}
+      .qr-name{font-weight:700;color:var(--text);font-size:15px;margin-top:6px}
+      .qr-code-text{font-family:var(--mono);font-size:11px;color:var(--text-faint);word-break:break-all;
+        margin-top:8px;user-select:all}
+      .qr-scan-wrap{position:relative;margin:14px auto 0;width:100%;max-width:300px;aspect-ratio:1;
+        border-radius:var(--radius-md);overflow:hidden;background:#000}
+      .qr-scan-wrap video{width:100%;height:100%;object-fit:cover}
+      .qr-scan-frame{position:absolute;inset:16%;border:2px solid var(--brand-2);border-radius:14px;
+        box-shadow:0 0 0 9999px rgba(0,0,0,0.32)}
     `;
     const s = document.createElement("style");
     s.textContent = css;
@@ -2012,6 +2032,210 @@ function boot() {
     } catch (e) {
       window.App.toast("Could not delete user");
     }
+  }
+
+  // ---------- Pay by QR code ----------
+  // Each user can show a QR that encodes their account; scanning a colleague's
+  // QR selects them as the transfer recipient. QR images are generated locally
+  // (no data leaves the device); scanning uses the native BarcodeDetector when
+  // available, with a jsQR fallback and a paste-a-code fallback.
+  const QR_PREFIX = "ithbank://pay?";
+
+  function buildQRPayload() {
+    return QR_PREFIX + "uid=" + encodeURIComponent(me.uid) +
+      "&name=" + encodeURIComponent(me.displayName || "");
+  }
+
+  // Accept the full scheme, a raw "uid=...&name=..." query, or a bare uid.
+  function parseQRPayload(str) {
+    if (!str) return null;
+    str = String(str).trim();
+    let uid = null, name = null;
+    const i = str.indexOf("pay?");
+    if (i >= 0) {
+      const p = new URLSearchParams(str.slice(i + 4));
+      uid = p.get("uid"); name = p.get("name");
+    } else if (str.indexOf("uid=") >= 0) {
+      const p = new URLSearchParams(str);
+      uid = p.get("uid"); name = p.get("name");
+    } else if (/^[a-z0-9-]+$/.test(str)) {
+      uid = str;
+    }
+    return uid ? { uid, name } : null;
+  }
+
+  let scanStream = null, scanRAF = null, scanDetector = null, scanJsQR = null, scanning = false;
+  const scanCanvas = document.createElement("canvas");
+
+  function buildQRUI() {
+    // Action row on the transfer screen
+    const form = document.getElementById("transferForm");
+    if (form && !document.getElementById("qrActionRow")) {
+      const row = document.createElement("div");
+      row.id = "qrActionRow";
+      row.className = "qr-action-row";
+      row.innerHTML = `
+        <button type="button" class="qr-chip" id="scanPayBtn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M3 12h18"/></svg>
+          Scan to pay
+        </button>
+        <button type="button" class="qr-chip" id="myQrBtn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3M21 21v.01M17 21h.01M21 17h.01"/></svg>
+          My QR code
+        </button>`;
+      form.parentNode.insertBefore(row, form);
+      row.querySelector("#scanPayBtn").onclick = startScan;
+      row.querySelector("#myQrBtn").onclick = showMyQR;
+    }
+
+    // My-QR modal
+    if (!document.getElementById("myQrModal")) {
+      const m = document.createElement("div");
+      m.className = "modal-overlay";
+      m.id = "myQrModal";
+      m.innerHTML = `
+        <div class="modal" style="text-align:center;max-width:360px">
+          <h3>My payment QR</h3>
+          <p>Ask a colleague to scan this with “Scan to pay” to send you money.</p>
+          <div class="qr-box" id="myQrBox"><div class="qr-loading">Generating…</div></div>
+          <div class="qr-name" id="myQrName"></div>
+          <div class="qr-code-text" id="myQrText"></div>
+          <div class="btn-row"><button class="btn btn-primary" id="myQrClose">Done</button></div>
+        </div>`;
+      document.body.appendChild(m);
+      m.addEventListener("click", (e) => { if (e.target === m) m.classList.remove("open"); });
+      m.querySelector("#myQrClose").onclick = () => m.classList.remove("open");
+    }
+
+    // Scan modal
+    if (!document.getElementById("scanQrModal")) {
+      const m = document.createElement("div");
+      m.className = "modal-overlay";
+      m.id = "scanQrModal";
+      m.innerHTML = `
+        <div class="modal" style="text-align:center;max-width:380px">
+          <h3>Scan to pay</h3>
+          <p id="scanHint">Point your camera at a colleague's QR code.</p>
+          <div class="qr-scan-wrap"><video id="scanVideo" playsinline muted></video><div class="qr-scan-frame"></div></div>
+          <input class="gate-input" id="scanManual" placeholder="…or paste a pay code" style="margin-top:14px" />
+          <div class="btn-row">
+            <button class="btn btn-ghost" id="scanCancel" style="max-width:120px">Cancel</button>
+            <button class="btn btn-primary" id="scanManualBtn">Use code</button>
+          </div>
+        </div>`;
+      document.body.appendChild(m);
+      m.addEventListener("click", (e) => { if (e.target === m) stopScan(); });
+      m.querySelector("#scanCancel").onclick = stopScan;
+      m.querySelector("#scanManualBtn").onclick = () => {
+        const parsed = parseQRPayload(document.getElementById("scanManual").value);
+        if (!parsed) { window.App.toast("Enter a valid pay code"); return; }
+        applyScannedRecipient(parsed);
+      };
+    }
+  }
+
+  async function showMyQR() {
+    if (!me) { window.App.toast("Please sign in first"); return; }
+    const box = document.getElementById("myQrBox");
+    const payload = buildQRPayload();
+    document.getElementById("myQrName").textContent = me.displayName || "";
+    document.getElementById("myQrText").textContent = payload;
+    box.innerHTML = `<div class="qr-loading">Generating…</div>`;
+    document.getElementById("myQrModal").classList.add("open");
+    try {
+      const mod = await import("https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/+esm");
+      const qrcode = mod.default || mod.qrcode || mod;
+      const qr = qrcode(0, "M");
+      qr.addData(payload);
+      qr.make();
+      box.innerHTML = `<img alt="Payment QR code" src="${qr.createDataURL(7, 1)}">`;
+    } catch (e) {
+      box.innerHTML = `<div class="qr-loading">Couldn't draw the QR — share the code below instead.</div>`;
+    }
+  }
+
+  async function startScan() {
+    if (!me) { window.App.toast("Please sign in first"); return; }
+    const video = document.getElementById("scanVideo");
+    const hint = document.getElementById("scanHint");
+    document.getElementById("scanManual").value = "";
+    hint.textContent = "Point your camera at a colleague's QR code.";
+    document.getElementById("scanQrModal").classList.add("open");
+    scanning = true;
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      hint.textContent = "No camera here — paste a pay code below instead."; return;
+    }
+    try {
+      scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      video.srcObject = scanStream;
+      await video.play();
+    } catch (e) {
+      hint.textContent = "Camera unavailable — paste a pay code below instead."; return;
+    }
+
+    scanDetector = null; scanJsQR = null;
+    if ("BarcodeDetector" in window) {
+      try { scanDetector = new window.BarcodeDetector({ formats: ["qr_code"] }); } catch (e) {}
+    }
+    if (!scanDetector) {
+      try { const mod = await import("https://cdn.jsdelivr.net/npm/jsqr@1.4.0/+esm"); scanJsQR = mod.default || mod; }
+      catch (e) {}
+    }
+    if (!scanDetector && !scanJsQR) {
+      hint.textContent = "Live scanning isn't supported here — paste a pay code below."; return;
+    }
+    loopScan(video);
+  }
+
+  async function loopScan(video) {
+    if (!scanning) return;
+    try {
+      let result = null;
+      if (scanDetector) {
+        const codes = await scanDetector.detect(video);
+        if (codes && codes.length) result = codes[0].rawValue;
+      } else if (scanJsQR && video.videoWidth) {
+        const c = scanCanvas; c.width = video.videoWidth; c.height = video.videoHeight;
+        const ctx = c.getContext("2d");
+        ctx.drawImage(video, 0, 0, c.width, c.height);
+        const img = ctx.getImageData(0, 0, c.width, c.height);
+        const code = scanJsQR(img.data, c.width, c.height);
+        if (code) result = code.data;
+      }
+      if (result) {
+        const parsed = parseQRPayload(result);
+        if (parsed) { applyScannedRecipient(parsed); return; }
+      }
+    } catch (e) {}
+    scanRAF = requestAnimationFrame(() => loopScan(video));
+  }
+
+  function applyScannedRecipient({ uid, name }) {
+    if (uid === me.uid) { window.App.toast("That's your own code 🙂"); return; }
+    const sel = document.getElementById("recipient");
+    if (!sel || sel.tagName !== "SELECT") { stopScan(); window.App.toast("Open a transfer first"); return; }
+    sel.value = uid;
+    if (sel.value !== uid) { window.App.toast("That colleague isn't in your directory"); return; }
+    stopScan();
+    sel.dispatchEvent(new Event("change"));
+    window.App.go("transfer");
+    const amt = document.getElementById("amount");
+    if (amt) { amt.focus(); amt.select && amt.select(); }
+    const who = (sel.options[sel.selectedIndex] && sel.options[sel.selectedIndex].dataset.name) || name || "colleague";
+    window.App.toast("Paying " + who + " — enter an amount");
+  }
+
+  function stopScan() {
+    scanning = false;
+    if (scanRAF) { cancelAnimationFrame(scanRAF); scanRAF = null; }
+    if (scanStream) { scanStream.getTracks().forEach((t) => t.stop()); scanStream = null; }
+    const video = document.getElementById("scanVideo");
+    if (video) video.srcObject = null;
+    const modal = document.getElementById("scanQrModal");
+    if (modal) modal.classList.remove("open");
   }
 
   function escapeHtml(s) {
