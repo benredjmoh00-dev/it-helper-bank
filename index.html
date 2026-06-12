@@ -2041,27 +2041,36 @@ function boot() {
   // available, with a jsQR fallback and a paste-a-code fallback.
   const QR_PREFIX = "ithbank://pay?";
 
-  function buildQRPayload() {
-    return QR_PREFIX + "uid=" + encodeURIComponent(me.uid) +
+  // The recipient can bake a requested amount into their QR (&amt=).
+  function buildQRPayload(amount) {
+    let s = QR_PREFIX + "uid=" + encodeURIComponent(me.uid) +
       "&name=" + encodeURIComponent(me.displayName || "");
+    if (amount && amount > 0) s += "&amt=" + encodeURIComponent(amount.toFixed(2));
+    return s;
+  }
+
+  function parseQRAmount(str) {
+    if (!str) return 0;
+    const n = parseFloat(String(str).replace(/[^0-9.,]/g, "").replace(",", "."));
+    return n > 0 ? n : 0;
   }
 
   // Accept the full scheme, a raw "uid=...&name=..." query, or a bare uid.
   function parseQRPayload(str) {
     if (!str) return null;
     str = String(str).trim();
-    let uid = null, name = null;
+    let uid = null, name = null, amt = null;
     const i = str.indexOf("pay?");
     if (i >= 0) {
       const p = new URLSearchParams(str.slice(i + 4));
-      uid = p.get("uid"); name = p.get("name");
+      uid = p.get("uid"); name = p.get("name"); amt = p.get("amt");
     } else if (str.indexOf("uid=") >= 0) {
       const p = new URLSearchParams(str);
-      uid = p.get("uid"); name = p.get("name");
+      uid = p.get("uid"); name = p.get("name"); amt = p.get("amt");
     } else if (/^[a-z0-9-]+$/.test(str)) {
       uid = str;
     }
-    return uid ? { uid, name } : null;
+    return uid ? { uid, name, amount: amt ? (parseFloat(amt) || 0) : 0 } : null;
   }
 
   let scanStream = null, scanRAF = null, scanDetector = null, scanJsQR = null, scanning = false;
@@ -2097,16 +2106,28 @@ function boot() {
       m.id = "myQrModal";
       m.innerHTML = `
         <div class="modal" style="text-align:center;max-width:360px">
-          <h3>My payment QR</h3>
-          <p>Ask a colleague to scan this with “Scan to pay” to send you money.</p>
+          <h3>Request a payment</h3>
+          <p>Enter the amount you want to receive, then show this QR to a colleague.</p>
+          <div class="field" style="text-align:left;margin-top:6px;margin-bottom:6px">
+            <label>Amount to request</label>
+            <div class="input-wrap"><span class="prefix">€</span>
+              <input class="fld has-prefix" type="text" inputmode="decimal" id="myQrAmount" value="50.00" /></div>
+          </div>
           <div class="qr-box" id="myQrBox"><div class="qr-loading">Generating…</div></div>
           <div class="qr-name" id="myQrName"></div>
           <div class="qr-code-text" id="myQrText"></div>
-          <div class="btn-row"><button class="btn btn-primary" id="myQrClose">Done</button></div>
+          <div class="btn-row">
+            <button class="btn btn-ghost" id="myQrClose" style="max-width:120px">Done</button>
+            <button class="btn btn-primary" id="myQrGen">Generate QR</button>
+          </div>
         </div>`;
       document.body.appendChild(m);
       m.addEventListener("click", (e) => { if (e.target === m) m.classList.remove("open"); });
       m.querySelector("#myQrClose").onclick = () => m.classList.remove("open");
+      m.querySelector("#myQrGen").onclick = renderMyQR;
+      const amtIn = m.querySelector("#myQrAmount");
+      amtIn.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); renderMyQR(); } });
+      amtIn.addEventListener("blur", () => { const v = parseQRAmount(amtIn.value); if (v > 0) amtIn.value = v.toFixed(2); renderMyQR(); });
     }
 
     // Scan modal
@@ -2136,14 +2157,21 @@ function boot() {
     }
   }
 
-  async function showMyQR() {
+  function showMyQR() {
     if (!me) { window.App.toast("Please sign in first"); return; }
-    const box = document.getElementById("myQrBox");
-    const payload = buildQRPayload();
     document.getElementById("myQrName").textContent = me.displayName || "";
+    document.getElementById("myQrModal").classList.add("open");
+    renderMyQR();
+  }
+
+  // (Re)draw the QR for the amount currently typed in the request field.
+  async function renderMyQR() {
+    if (!me) return;
+    const box = document.getElementById("myQrBox");
+    const amount = parseQRAmount(document.getElementById("myQrAmount").value);
+    const payload = buildQRPayload(amount);
     document.getElementById("myQrText").textContent = payload;
     box.innerHTML = `<div class="qr-loading">Generating…</div>`;
-    document.getElementById("myQrModal").classList.add("open");
     try {
       const mod = await import("https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/+esm");
       const qrcode = mod.default || mod.qrcode || mod;
@@ -2213,7 +2241,7 @@ function boot() {
     scanRAF = requestAnimationFrame(() => loopScan(video));
   }
 
-  function applyScannedRecipient({ uid, name }) {
+  function applyScannedRecipient({ uid, name, amount }) {
     if (uid === me.uid) { window.App.toast("That's your own code 🙂"); return; }
     const sel = document.getElementById("recipient");
     if (!sel || sel.tagName !== "SELECT") { stopScan(); window.App.toast("Open a transfer first"); return; }
@@ -2222,10 +2250,15 @@ function boot() {
     stopScan();
     sel.dispatchEvent(new Event("change"));
     window.App.go("transfer");
-    const amt = document.getElementById("amount");
-    if (amt) { amt.focus(); amt.select && amt.select(); }
     const who = (sel.options[sel.selectedIndex] && sel.options[sel.selectedIndex].dataset.name) || name || "colleague";
-    window.App.toast("Paying " + who + " — enter an amount");
+    const amt = document.getElementById("amount");
+    if (amt) {
+      if (amount && amount > 0) amt.value = amount.toFixed(2);
+      amt.focus(); amt.select && amt.select();
+    }
+    window.App.toast(amount && amount > 0
+      ? "Paying " + who + " €" + amount.toFixed(2)
+      : "Paying " + who + " — enter an amount");
   }
 
   function stopScan() {
